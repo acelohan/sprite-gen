@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Adapter: Generate sprite via apithat gpt-image-2 and clean via sprite-gen cutout.
+Adapter: Generate sprite via apithat gpt-image-2 with native RGBA transparency.
 """
 import base64
 import json
@@ -8,6 +8,8 @@ import os
 import subprocess
 import sys
 import urllib.request
+import numpy as np
+from PIL import Image
 
 def get_api_key():
     return subprocess.check_output([
@@ -15,7 +17,7 @@ def get_api_key():
         "--env=prod", "--path=/custom-provider", "--plain"
     ], text=True).strip()
 
-def generate_image(prompt: str, out_path: str, model: str = "gpt-image-2"):
+def generate_sprite(prompt: str, out_path: str, model: str = "gpt-image-2"):
     api_key = get_api_key()
     url = "https://apithat.dev/v1/images/generations"
     payload = {
@@ -34,7 +36,7 @@ def generate_image(prompt: str, out_path: str, model: str = "gpt-image-2"):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
         }
     )
-    print(f"[1/3] Generating image via {model}...")
+    print(f"[1/2] Generating image via {model}...")
     with urllib.request.urlopen(req, timeout=180) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     
@@ -51,19 +53,28 @@ def generate_image(prompt: str, out_path: str, model: str = "gpt-image-2"):
     raw_path = out_path + ".raw.png"
     with open(raw_path, "wb") as f:
         f.write(raw_bytes)
-    print(f"[2/3] Saved raw image to {raw_path}")
-    return raw_path
 
-def cutout(raw_path: str, out_path: str):
-    print(f"[3/3] Running sprite-gen cutout...")
-    cmd = [
-        "/home/hermes-agent/sprite-gen/.venv/bin/sprite-gen",
-        "cutout",
-        raw_path,
-        "--out", out_path
-    ]
-    subprocess.check_call(cmd)
-    print(f"Done! Transparent sprite saved to {out_path}")
+    # Process native transparency
+    print(f"[2/2] Validating and cleaning native alpha channel...")
+    img = Image.open(raw_path)
+    if img.mode != "RGBA":
+        print(f"Warning: Image mode is {img.mode}, running cutout fallback...")
+        cmd = ["/home/hermes-agent/sprite-gen/.venv/bin/sprite-gen", "cutout", raw_path, "--out", out_path]
+        subprocess.check_call(cmd)
+        return
+
+    arr = np.array(img)
+    # Scrub dirty RGB under zero/near-zero alpha (< 5)
+    mask = arr[:, :, 3] < 5
+    arr[mask, 3] = 0
+    arr[mask, :3] = 0
+
+    clean_img = Image.fromarray(arr)
+    clean_img.save(out_path)
+
+    alpha_hist = clean_img.getchannel("A").histogram()
+    trans_pct = alpha_hist[0] / (clean_img.size[0] * clean_img.size[1]) * 100
+    print(f"Done! Clean transparent RGBA ({trans_pct:.1f}% alpha 0) -> {out_path}")
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
@@ -71,5 +82,4 @@ if __name__ == "__main__":
         sys.exit(1)
     out_file = sys.argv[1]
     prompt_text = sys.argv[2]
-    raw = generate_image(prompt_text, out_file)
-    cutout(raw, out_file)
+    generate_sprite(prompt_text, out_file)
